@@ -1,6 +1,7 @@
 use std::{
     f32::consts::TAU,
     ops::{Add, AddAssign, Div, Index, IndexMut, Mul},
+    time::Instant,
 };
 
 use ::rand::{random, seq::SliceRandom, thread_rng};
@@ -8,7 +9,7 @@ use macroquad::prelude::*;
 use smallvec::SmallVec;
 
 #[allow(non_upper_case_globals)]
-const gravity: Vec2 = Vec2::new(0.0, -30.0);
+const gravity: Vec2 = Vec2::new(0.0, -60.0);
 #[allow(non_upper_case_globals)]
 const particle_radius: f32 = 0.3;
 #[allow(non_upper_case_globals)]
@@ -192,8 +193,10 @@ struct Fluid {
     solids: Grid<bool>,
     xvel: Grid<f32>,
     xvel_weights: Grid<f32>,
+    last_xvel: Grid<f32>,
     yvel: Grid<f32>,
     yvel_weights: Grid<f32>,
+    last_yvel: Grid<f32>,
     divergence: Grid<f32>,
     density: Grid<f32>,
     // Contains particles in area [x..x+1) x [y..y+1).
@@ -266,6 +269,8 @@ impl Fluid {
                 x / w.max(0.0001)
             }
         });
+        self.last_xvel.load_fn(|pos| self.xvel[pos]);
+        self.last_yvel.load_fn(|pos| self.yvel[pos]);
     }
     fn pressure_solve(&mut self) {
         for x in (0..self.size().x).rev() {
@@ -307,19 +312,22 @@ impl Fluid {
             }
         }
     }
-    fn g2p(&mut self) {
+    fn g2p(&mut self, flip_ratio: f32) {
         for p in &mut self.particles {
-            p.vel.x = self.xvel.sample(p.pos); // , |_, pos| self.xvel_weights[pos] <= 0.0001);
-            p.vel.y = self.yvel.sample(p.pos); // , |_, pos| self.yvel_weights[pos] <= 0.0001);
+            p.vel.x =
+                self.xvel.sample(p.pos) + (p.vel.x - self.last_xvel.sample(p.pos)) * flip_ratio;
+            p.vel.y =
+                self.yvel.sample(p.pos) + (p.vel.y - self.last_yvel.sample(p.pos)) * flip_ratio;
         }
     }
-    fn step(&mut self) {
+    fn step(&mut self, flip_ratio: f32) {
         self.p2g();
         for _ in 0..50 {
             self.pressure_solve();
         }
-        self.g2p();
+        self.g2p(flip_ratio);
         self.advect();
+        self.clamp();
         self.remap();
         self.random_collide();
         self.clamp();
@@ -334,10 +342,11 @@ impl Fluid {
                 let p2 = self.particles[ixs[1] as usize];
                 let dist = p1.pos.distance(p2.pos);
                 if dist < 2.0 * particle_radius {
-                    let normal = (p1.pos - p2.pos).normalize();
-                    let move_dist = particle_radius - dist / 2.0;
-                    self.particles[ixs[0] as usize].pos += normal * move_dist;
-                    self.particles[ixs[1] as usize].pos -= normal * move_dist;
+                    if let Some(normal) = (p1.pos - p2.pos).try_normalize() {
+                        let move_dist = particle_radius - dist / 2.0;
+                        self.particles[ixs[0] as usize].pos += normal * move_dist;
+                        self.particles[ixs[1] as usize].pos -= normal * move_dist;
+                    }
                 }
             }
         })
@@ -351,8 +360,10 @@ impl Fluid {
             solids,
             xvel: Grid::with_offset(size + IVec2::new(1, 2), Vec2::new(0.0, -0.5), 0.0),
             xvel_weights: Grid::with_offset(size + IVec2::new(1, 2), Vec2::new(0.0, -0.5), 0.0),
+            last_xvel: Grid::with_offset(size + IVec2::new(1, 2), Vec2::new(0.0, -0.5), 0.0),
             yvel: Grid::with_offset(size + IVec2::new(2, 1), Vec2::new(-0.5, 0.0), 0.0),
             yvel_weights: Grid::with_offset(size + IVec2::new(2, 1), Vec2::new(-0.5, 0.0), 0.0),
+            last_yvel: Grid::with_offset(size + IVec2::new(2, 1), Vec2::new(-0.5, 0.0), 0.0),
             divergence: Grid::new(size, 0.0),
             density: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
             grid_particles: Grid::new(size, SmallVec::new()),
@@ -381,7 +392,7 @@ impl Fluid {
             let color = if self.solids[pos] {
                 RED
             } else {
-                Color::from_vec((Vec3::splat(1.0) * (particles.len() as f32) / 4.0).extend(0.1))
+                Color::from_vec((Vec3::splat(1.0) * (particles.len() as f32) / 6.0).extend(1.0))
             };
             let pos = pos.as_vec2() * scale;
             draw_rectangle(pos.x, screen_height() - pos.y - scale, scale, scale, color);
@@ -419,11 +430,14 @@ impl Fluid {
 #[macroquad::main("BasicShapes")]
 async fn main() {
     let mut paused = false;
-    let mut fluid = Fluid::init_grid(128, 80);
-    fluid.fill_rect(IVec2::new(5, 5), IVec2::new(40, 60));
+    let mut fluid = Fluid::init_grid(200, 100);
+    fluid.fill_rect(IVec2::new(5, 5), IVec2::new(100, 70));
     fluid.remap();
 
-    request_new_screen_size(fluid.size().x as f32 * 10.0, fluid.size().y as f32 * 10.0);
+    request_new_screen_size(fluid.size().x as f32 * 8.0, fluid.size().y as f32 * 8.0);
+
+    let start = Instant::now();
+    let mut i = 0;
 
     loop {
         clear_background(BLACK);
@@ -433,11 +447,17 @@ async fn main() {
         }
 
         if !paused {
-            fluid.step();
+            fluid.step(0.95);
         }
 
-        fluid.draw_grid(10.0);
-        fluid.draw_particles(10.0);
+        i += 1;
+        if i % 60 == 0 {
+            let elapsed = start.elapsed().as_secs_f32();
+            println!("FPS: {}", i as f32 / elapsed);
+        }
+
+        fluid.draw_grid(8.0);
+        // fluid.draw_particles(8.0);
 
         next_frame().await
     }
