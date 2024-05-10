@@ -9,6 +9,8 @@ use smallvec::SmallVec;
 #[allow(non_upper_case_globals)]
 const gravity: Vec2 = Vec2::new(0.0, -30.0);
 #[allow(non_upper_case_globals)]
+const particle_radius: f32 = 0.3;
+#[allow(non_upper_case_globals)]
 const dt: f32 = 1.0 / 60.0;
 
 #[derive(Debug, Clone)]
@@ -202,10 +204,27 @@ impl Fluid {
         for p in &mut self.particles {
             p.vel += gravity * dt;
             p.vel += 0.01 * Vec2::from_angle(rand::gen_range(0.0, TAU));
-            if self.solids[(p.pos + p.vel * dt).floor().as_ivec2()] {
-                p.vel = Vec2::ZERO;
+            if p.vel.is_nan() {
+                panic!("nan velocity");
             }
-            p.pos += p.vel * dt;
+            let mut pos = p.pos + p.vel * dt;
+            if pos.x < 1.0 + particle_radius {
+                pos.x = 1.0 + particle_radius;
+                p.vel.x = 0.0;
+            }
+            if pos.y < 1.0 + particle_radius {
+                pos.y = 1.0 + particle_radius;
+                p.vel.y = 0.0;
+            }
+            if pos.x > self.grid_particles.size.x as f32 - 1.0 - particle_radius {
+                pos.x = self.grid_particles.size.x as f32 - 1.0 - particle_radius;
+                p.vel.x = 0.0;
+            }
+            if pos.y > self.grid_particles.size.y as f32 - 1.0 - particle_radius {
+                pos.y = self.grid_particles.size.y as f32 - 1.0 - particle_radius;
+                p.vel.y = 0.0;
+            }
+            p.pos = pos;
         }
     }
     fn remap(&mut self) {
@@ -216,9 +235,9 @@ impl Fluid {
     }
     fn p2g(&mut self) {
         self.xvel.set(0.0);
-        self.xvel_weights.set(0.0);
+        self.xvel_weights.set(0.0001);
         self.yvel.set(0.0);
-        self.yvel_weights.set(0.0);
+        self.yvel_weights.set(0.0001);
         self.density.set(0.0);
         for p in &self.particles {
             self.xvel.distribute(p.pos, p.vel.x);
@@ -238,10 +257,18 @@ impl Fluid {
                     continue;
                 }
                 if self.solids[pos] {
-                    panic!("Invalid state");
+                    panic!(
+                        "Invalid state: {:?}, {:?}",
+                        pos,
+                        self.grid_particles[pos]
+                            .iter()
+                            .map(|i| self.particles[*i as usize])
+                            .collect::<Vec<_>>()
+                    );
                 }
                 let div = self.xvel[pos + IVec2::X] - self.xvel[pos] + self.yvel[pos + IVec2::Y]
-                    - self.yvel[pos];
+                    - self.yvel[pos]
+                    - 0.01;
                 let solid_count = self.solids[pos - IVec2::X] as u32
                     + self.solids[pos - IVec2::Y] as u32
                     + self.solids[pos + IVec2::X] as u32
@@ -325,13 +352,21 @@ impl Fluid {
             draw_rectangle(pos.x, screen_height() - pos.y - scale, scale, scale, color);
         })
     }
+    fn draw_nan_vels(&self, scale: f32) {
+        self.grid_particles.foreach(|pos, _| {
+            if self.xvel[pos].is_nan() || self.yvel[pos].is_nan() {
+                let pos = pos.as_vec2() * scale;
+                draw_rectangle(pos.x, screen_height() - pos.y - scale, scale, scale, BLUE);
+            }
+        })
+    }
     fn draw_particles(&self, scale: f32) {
         for p in &self.particles {
             let pos = p.pos * scale;
             draw_circle(
                 pos.x,
                 screen_height() - pos.y,
-                scale * 0.2,
+                scale * particle_radius,
                 Color {
                     r: 1.0,
                     g: 1.0,
@@ -363,7 +398,8 @@ async fn main() {
             fluid.step();
         }
 
-        fluid.draw_grid(10.0);
+        // fluid.draw_grid(10.0);
+        fluid.draw_nan_vels(10.0);
         fluid.draw_particles(10.0);
 
         next_frame().await
