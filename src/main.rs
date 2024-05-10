@@ -3,6 +3,7 @@ use std::{
     ops::{Add, AddAssign, Div, Index, IndexMut, Mul},
 };
 
+use ::rand::{seq::SliceRandom, thread_rng};
 use macroquad::prelude::*;
 use smallvec::SmallVec;
 
@@ -207,7 +208,12 @@ impl Fluid {
             if p.vel.is_nan() {
                 panic!("nan velocity");
             }
-            let mut pos = p.pos + p.vel * dt;
+            p.pos += p.vel * dt;
+        }
+    }
+    fn clamp(&mut self) {
+        for p in &mut self.particles {
+            let pos = &mut p.pos;
             if pos.x < 1.0 + particle_radius {
                 pos.x = 1.0 + particle_radius;
                 p.vel.x = 0.0;
@@ -224,7 +230,6 @@ impl Fluid {
                 pos.y = self.grid_particles.size.y as f32 - 1.0 - particle_radius;
                 p.vel.y = 0.0;
             }
-            p.pos = pos;
         }
     }
     fn remap(&mut self) {
@@ -306,6 +311,23 @@ impl Fluid {
         self.g2p();
         self.advect();
         self.remap();
+    }
+    fn random_collide(&mut self) {
+        self.grid_particles.foreach(|_pos, mut particles| {
+            let particles = &mut *particles;
+            particles.shuffle(&mut thread_rng());
+            for ixs in particles.chunks_exact(2) {
+                let p1 = self.particles[ixs[0] as usize];
+                let p2 = self.particles[ixs[1] as usize];
+                let dist = p1.pos.distance(p2.pos);
+                if dist < 2.0 * particle_radius {
+                    let normal = (p1.pos - p2.pos).normalize();
+                    let move_dist = particle_radius - dist / 2.0;
+                    self.particles[ixs[0] as usize].pos += normal * move_dist;
+                    self.particles[ixs[1] as usize].pos -= normal * move_dist;
+                }
+            }
+        })
     }
     fn init_grid(width: u32, height: u32) -> Self {
         let size = UVec2::new(width, height).as_ivec2();
@@ -396,6 +418,9 @@ async fn main() {
 
         if !paused {
             fluid.step();
+            fluid.random_collide();
+            fluid.clamp();
+            fluid.remap();
         }
 
         // fluid.draw_grid(10.0);
