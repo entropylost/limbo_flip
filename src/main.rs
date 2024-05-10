@@ -296,7 +296,7 @@ impl Fluid {
                     + self.solids[pos + IVec2::X] as u32
                     + self.solids[pos + IVec2::Y] as u32;
                 let empty = (4 - solid_count) as f32;
-                let delta = 1.9 * (div - 1.0 * (self.density[pos] - 3.0).max(0.0)) / empty;
+                let delta = 1.9 * (div - 1.0 * (self.density[pos] - 4.0).max(0.0)) / empty;
                 if !self.solids[pos - IVec2::X] {
                     self.xvel[pos] += delta;
                 }
@@ -388,11 +388,11 @@ impl Fluid {
         }
     }
     fn draw_grid(&self, scale: f32) {
-        self.grid_particles.foreach(|pos, particles| {
+        self.density.foreach(|pos, particles| {
             let color = if self.solids[pos] {
                 RED
             } else {
-                Color::from_vec((Vec3::splat(1.0) * (particles.len() as f32) / 6.0).extend(1.0))
+                Color::from_vec((Vec3::splat(1.0) * (particles) / 6.0).extend(1.0))
             };
             let pos = pos.as_vec2() * scale;
             draw_rectangle(pos.x, screen_height() - pos.y - scale, scale, scale, color);
@@ -442,7 +442,7 @@ async fn main() {
     loop {
         clear_background(BLACK);
 
-        if is_key_pressed(KeyCode::Space) {
+        if is_key_pressed(KeyCode::Space) || is_key_pressed(KeyCode::Escape) {
             paused = !paused;
         }
 
