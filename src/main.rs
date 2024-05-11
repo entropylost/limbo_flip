@@ -192,7 +192,7 @@ impl ParticleType {
     fn density(&self) -> f32 {
         match self {
             ParticleType::Water => 1.0,
-            ParticleType::Air => 0.01,
+            ParticleType::Air => 0.1,
             ParticleType::Oil => 0.8,
         }
     }
@@ -523,7 +523,7 @@ async fn main() {
 
     let mut fluid = Fluid::init_grid(200, 100);
     fluid.fill_rect(IVec2::new(110, 5), IVec2::new(70, 70), ParticleType::Water);
-    fluid.fill_rect(IVec2::new(5, 5), IVec2::new(100, 70), ParticleType::Oil);
+    fluid.fill_rect(IVec2::new(5, 5), IVec2::new(100, 70), ParticleType::Air);
     fluid.remap();
 
     request_new_screen_size(fluid.size().x as f32 * 8.0, fluid.size().y as f32 * 8.0);
