@@ -9,7 +9,7 @@ use macroquad::prelude::*;
 use smallvec::SmallVec;
 
 #[allow(non_upper_case_globals)]
-const gravity: Vec2 = Vec2::new(0.0, -30.0);
+const gravity: Vec2 = Vec2::new(0.0, -2.0);
 #[allow(non_upper_case_globals)]
 const particle_radius: f32 = 0.3;
 #[allow(non_upper_case_globals)]
@@ -217,19 +217,19 @@ impl Fluid {
             let pos = &mut p.pos;
             if pos.x < 1.0 + particle_radius {
                 pos.x = 1.0 + particle_radius;
-                p.vel.x = 0.0;
+                p.vel.x = (-p.vel.x).max(0.0);
             }
             if pos.y < 1.0 + particle_radius {
                 pos.y = 1.0 + particle_radius;
-                p.vel.y = 0.0;
+                p.vel.y = (-p.vel.y).max(0.0);
             }
             if pos.x > size.x - 1.0 - particle_radius {
                 pos.x = size.x - 1.0 - particle_radius;
-                p.vel.x = 0.0;
+                p.vel.x = (-p.vel.x).min(0.0);
             }
             if pos.y > size.y - 1.0 - particle_radius {
                 pos.y = size.y - 1.0 - particle_radius;
-                p.vel.y = 0.0;
+                p.vel.y = (-p.vel.y).min(0.0);
             }
         }
     }
@@ -275,8 +275,10 @@ impl Fluid {
                     continue;
                 }
 
+                let density = self.density.sample(pos.as_vec2() + Vec2::new(0.5, 0.5));
+
                 let ideal_value =
-                    self.divergence[pos] + (self.density.sample(pos.as_vec2()) - 4.0).max(0.0);
+                    self.divergence[pos] * density + density * (density - 4.0).max(0.0);
                 // Do SOR by basically interpolating between the previous pressure with a >1 weight/
                 self.next_pressure[pos] = (ideal_value
                     - [(-1, -1), (-1, 1), (1, -1), (1, 1)]
@@ -292,11 +294,14 @@ impl Fluid {
         for x in 0..self.size().x {
             for y in 0..self.size().y {
                 let pos = IVec2::new(x, y);
+                let density = self.density[pos].max(0.0001);
                 let p11 = self.pressure[pos];
                 let p01 = self.pressure[pos - IVec2::X];
                 let p10 = self.pressure[pos - IVec2::Y];
                 let p00 = self.pressure[pos - IVec2::ONE];
-                self.vel[pos] += Vec2::new(p11 + p10 - p01 - p00, p11 + p01 - p10 - p00) / 2.0;
+                self.vel[pos] +=
+                    Vec2::new(p11 + p10 - p01 - p00, p11 + p01 - p10 - p00) / 2.0 / density;
+                // density;
             }
         }
     }
