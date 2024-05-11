@@ -9,7 +9,7 @@ use macroquad::prelude::*;
 use smallvec::SmallVec;
 
 #[allow(non_upper_case_globals)]
-const gravity: Vec2 = Vec2::new(0.0, -60.0);
+const GRAVITY: Vec2 = Vec2::new(0.0, -30.0);
 #[allow(non_upper_case_globals)]
 const particle_radius: f32 = 0.3;
 #[allow(non_upper_case_globals)]
@@ -182,10 +182,48 @@ impl<T: Add<Output = T> + Mul<f32, Output = T> + Clone> Grid<T> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParticleType {
+    Water,
+    Air,
+    Oil,
+}
+impl ParticleType {
+    fn density(&self) -> f32 {
+        match self {
+            ParticleType::Water => 1.0,
+            ParticleType::Air => 0.01,
+            ParticleType::Oil => 0.8,
+        }
+    }
+    fn color(&self) -> Color {
+        match self {
+            ParticleType::Water => BLUE,
+            ParticleType::Air => Color::from_vec(Vec4::new(1.0, 1.0, 1.0, 0.2)),
+            ParticleType::Oil => Color::from_vec(Vec4::new(0.5, 0.5, 0.5, 1.0)),
+        }
+    }
+    fn rest_density(&self) -> f32 {
+        match self {
+            ParticleType::Water => 4.0,
+            ParticleType::Air => 0.0,
+            ParticleType::Oil => 4.0 * 0.8,
+        }
+    }
+    fn gravity(&self) -> Vec2 {
+        match self {
+            ParticleType::Water => GRAVITY,
+            ParticleType::Air => Vec2::ZERO,
+            ParticleType::Oil => GRAVITY,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct Particle {
     pos: Vec2,
     vel: Vec2,
+    ty: ParticleType,
 }
 
 struct Fluid {
@@ -201,6 +239,7 @@ struct Fluid {
     next_pressure: Grid<f32>,
     divergence: Grid<f32>,
     density: Grid<f32>,
+    rest_density: Grid<f32>,
     // Contains particles in area [x..x+1) x [y..y+1).
     grid_particles: Grid<SmallVec<[u32; 6]>>,
 }
@@ -208,7 +247,7 @@ struct Fluid {
 impl Fluid {
     fn advect(&mut self) {
         for p in &mut self.particles {
-            p.vel += gravity * dt;
+            p.vel += p.ty.gravity() * dt;
             p.vel += 0.01 * Vec2::from_angle(random::<f32>() * TAU);
             if p.vel.is_nan() {
                 panic!("nan velocity");
@@ -250,12 +289,16 @@ impl Fluid {
         self.yvel.set(0.0);
         self.yvel_weights.set(0.0);
         self.density.set(0.0);
+        self.rest_density.set(0.0);
         for p in &self.particles {
-            self.xvel.distribute(p.pos, p.vel.x);
-            self.xvel_weights.distribute(p.pos, 1.0);
-            self.yvel.distribute(p.pos, p.vel.y);
-            self.yvel_weights.distribute(p.pos, 1.0);
-            self.density.distribute(p.pos, 1.0);
+            let density = p.ty.density();
+            self.xvel.distribute(p.pos, p.vel.x * density);
+            self.xvel_weights.distribute(p.pos, density);
+            self.yvel.distribute(p.pos, p.vel.y * density);
+            self.yvel_weights.distribute(p.pos, density);
+            self.density.distribute(p.pos, density);
+            self.rest_density
+                .distribute(p.pos, p.ty.rest_density() * density);
         }
         self.xvel = self.xvel.map2(&self.xvel_weights, |pos, x, w| {
             if self.solids[pos] || self.solids[pos - IVec2::X] {
@@ -271,6 +314,9 @@ impl Fluid {
                 x / w.max(0.0001)
             }
         });
+        self.rest_density = self
+            .rest_density
+            .map(|pos, x| x / self.density[pos].max(0.0001));
         self.last_xvel.load_fn(|pos| self.xvel[pos]);
         self.last_yvel.load_fn(|pos| self.yvel[pos]);
     }
@@ -295,7 +341,8 @@ impl Fluid {
                     continue;
                 }
                 let density = self.density[pos];
-                let ideal_value = (self.divergence[pos] - (density - 4.0)) * density;
+                let rest_density = self.rest_density[pos];
+                let ideal_value = (self.divergence[pos]) * density - (density - rest_density) * 4.0;
                 let pressure = self.pressure[pos];
                 let adj_pressures = [
                     (-1, 0, -self.xvel[pos], self.xvel_weights[pos]),
@@ -366,9 +413,9 @@ impl Fluid {
         self.advect();
         self.clamp();
         self.remap();
-        self.random_collide();
-        self.clamp();
-        self.remap();
+        // self.random_collide();
+        // self.clamp();
+        // self.remap();
     }
     fn random_collide(&mut self) {
         self.grid_particles.foreach(|_pos, mut particles| {
@@ -380,6 +427,7 @@ impl Fluid {
                 let dist = p1.pos.distance(p2.pos);
                 if dist < 2.0 * particle_radius {
                     if let Some(normal) = (p1.pos - p2.pos).try_normalize() {
+                        // TODO: Adjust for particle type.
                         let move_dist = particle_radius - dist / 2.0;
                         self.particles[ixs[0] as usize].pos += normal * move_dist;
                         self.particles[ixs[1] as usize].pos -= normal * move_dist;
@@ -405,10 +453,11 @@ impl Fluid {
             next_pressure: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
             divergence: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
             density: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
+            rest_density: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
             grid_particles: Grid::new(size, SmallVec::new()),
         }
     }
-    fn fill_rect(&mut self, start: IVec2, size: IVec2) {
+    fn fill_rect(&mut self, start: IVec2, size: IVec2, ty: ParticleType) {
         for y in start.y..start.y + size.y {
             for x in start.x..start.x + size.x {
                 let pos = IVec2::new(x, y);
@@ -419,6 +468,7 @@ impl Fluid {
                                 + Vec2::new(i as f32, j as f32) * 0.5
                                 + Vec2::new(random::<f32>() * 0.5, random::<f32>() * 0.5),
                             vel: Vec2::ZERO,
+                            ty,
                         };
                         self.particles.push(particle);
                     }
@@ -455,12 +505,7 @@ impl Fluid {
                 pos.x,
                 screen_height() - pos.y,
                 scale * particle_radius,
-                Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.2,
-                },
+                p.ty.color(),
             );
         }
     }
@@ -477,7 +522,8 @@ async fn main() {
     let mut density = false;
 
     let mut fluid = Fluid::init_grid(200, 100);
-    fluid.fill_rect(IVec2::new(5, 5), IVec2::new(100, 70));
+    fluid.fill_rect(IVec2::new(110, 5), IVec2::new(70, 70), ParticleType::Water);
+    fluid.fill_rect(IVec2::new(5, 5), IVec2::new(100, 70), ParticleType::Oil);
     fluid.remap();
 
     request_new_screen_size(fluid.size().x as f32 * 8.0, fluid.size().y as f32 * 8.0);
@@ -493,7 +539,7 @@ async fn main() {
         }
 
         if !paused || is_key_pressed(KeyCode::Period) {
-            fluid.step(0.95);
+            fluid.step(0.0);
         }
         if is_key_pressed(KeyCode::P) {
             pressure = !pressure;
