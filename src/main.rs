@@ -437,12 +437,15 @@ impl Fluid {
             draw_rectangle(pos.x, screen_height() - pos.y - scale, scale, scale, color);
         })
     }
-    fn draw_nan_vels(&self, scale: f32) {
-        self.grid_particles.foreach(|pos, _| {
-            if self.xvel[pos].is_nan() || self.yvel[pos].is_nan() {
-                let pos = pos.as_vec2() * scale;
-                draw_rectangle(pos.x, screen_height() - pos.y - scale, scale, scale, BLUE);
-            }
+    fn draw_pressure(&self, scale: f32) {
+        self.pressure.foreach(|pos, pressure| {
+            let color = if self.solids[pos] {
+                RED
+            } else {
+                Color::from_vec(Vec3::splat(pressure.log2() / 20.0).extend(1.0))
+            };
+            let pos = pos.as_vec2() * scale;
+            draw_rectangle(pos.x, screen_height() - pos.y - scale, scale, scale, color);
         })
     }
     fn draw_particles(&self, scale: f32) {
@@ -469,6 +472,10 @@ impl Fluid {
 #[macroquad::main("BasicShapes")]
 async fn main() {
     let mut paused = false;
+    let mut pressure = false;
+    let mut particles = true;
+    let mut density = false;
+
     let mut fluid = Fluid::init_grid(200, 100);
     fluid.fill_rect(IVec2::new(5, 5), IVec2::new(100, 70));
     fluid.remap();
@@ -485,8 +492,17 @@ async fn main() {
             paused = !paused;
         }
 
-        if !paused {
+        if !paused || is_key_pressed(KeyCode::Period) {
             fluid.step(0.95);
+        }
+        if is_key_pressed(KeyCode::P) {
+            pressure = !pressure;
+        }
+        if is_key_pressed(KeyCode::O) {
+            particles = !particles;
+        }
+        if is_key_pressed(KeyCode::G) {
+            density = !density;
         }
 
         i += 1;
@@ -495,8 +511,15 @@ async fn main() {
             println!("FPS: {}", i as f32 / elapsed);
         }
 
-        // fluid.draw_grid(8.0);
-        fluid.draw_particles(8.0);
+        if density {
+            fluid.draw_grid(8.0);
+        }
+        if pressure {
+            fluid.draw_pressure(8.0);
+        }
+        if particles {
+            fluid.draw_particles(8.0);
+        }
 
         next_frame().await
     }
