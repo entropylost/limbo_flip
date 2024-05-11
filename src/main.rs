@@ -197,6 +197,8 @@ struct Fluid {
     yvel: Grid<f32>,
     yvel_weights: Grid<f32>,
     last_yvel: Grid<f32>,
+    pressure: Grid<f32>,
+    next_pressure: Grid<f32>,
     divergence: Grid<f32>,
     density: Grid<f32>,
     // Contains particles in area [x..x+1) x [y..y+1).
@@ -272,6 +274,16 @@ impl Fluid {
         self.last_xvel.load_fn(|pos| self.xvel[pos]);
         self.last_yvel.load_fn(|pos| self.yvel[pos]);
     }
+    fn init_pressure(&mut self) {
+        self.divergence.load_fn(|pos| {
+            let x1 = self.xvel[pos + IVec2::X];
+            let x0 = self.xvel[pos];
+            let y1 = self.yvel[pos + IVec2::Y];
+            let y0 = self.yvel[pos];
+            x1 - x0 + y1 - y0
+        });
+        self.pressure.set(0.0);
+    }
     fn pressure_solve(&mut self) {
         for x in (0..self.size().x).rev() {
             for y in (0..self.size().y).rev() {
@@ -280,34 +292,57 @@ impl Fluid {
                     continue;
                 }
                 if self.solids[pos] {
-                    panic!(
-                        "Invalid state: {:?}, {:?}",
-                        pos,
-                        self.grid_particles[pos]
-                            .iter()
-                            .map(|i| self.particles[*i as usize])
-                            .collect::<Vec<_>>()
-                    );
+                    continue;
                 }
-                let div = self.xvel[pos + IVec2::X] - self.xvel[pos] + self.yvel[pos + IVec2::Y]
-                    - self.yvel[pos];
-                let solid_count = self.solids[pos - IVec2::X] as u32
-                    + self.solids[pos - IVec2::Y] as u32
-                    + self.solids[pos + IVec2::X] as u32
-                    + self.solids[pos + IVec2::Y] as u32;
-                let empty = (4 - solid_count) as f32;
-                let delta = 1.9 * (div - 1.0 * (self.density[pos] - 4.0).max(0.0)) / empty;
-                if !self.solids[pos - IVec2::X] {
-                    self.xvel[pos] += delta;
-                }
-                if !self.solids[pos - IVec2::Y] {
-                    self.yvel[pos] += delta;
-                }
-                if !self.solids[pos + IVec2::X] {
-                    self.xvel[pos + IVec2::X] -= delta;
-                }
-                if !self.solids[pos + IVec2::Y] {
-                    self.yvel[pos + IVec2::Y] -= delta;
+                let density = self.density[pos];
+                let ideal_value = (self.divergence[pos] - (density - 4.0)) * density;
+                let pressure = self.pressure[pos];
+                let adj_pressures = [
+                    (-1, 0, -self.xvel[pos], self.xvel_weights[pos]),
+                    (
+                        1,
+                        0,
+                        self.xvel[pos + IVec2::X],
+                        self.xvel_weights[pos + IVec2::X],
+                    ),
+                    (0, -1, -self.yvel[pos], self.yvel_weights[pos]),
+                    (
+                        0,
+                        1,
+                        self.yvel[pos + IVec2::Y],
+                        self.yvel_weights[pos + IVec2::Y],
+                    ),
+                ]
+                .into_iter()
+                .map(|(dx, dy, vel, weight)| {
+                    let pos = pos + IVec2::new(dx, dy);
+                    if self.solids[pos] {
+                        pressure + vel * weight
+                    } else {
+                        self.pressure[pos]
+                    }
+                })
+                .sum::<f32>();
+
+                self.next_pressure[pos] = (adj_pressures - ideal_value) / 4.0;
+            }
+        }
+        std::mem::swap(&mut self.pressure, &mut self.next_pressure);
+    }
+    fn finish_pressure(&mut self) {
+        for x in 0..self.size().x {
+            for y in 0..self.size().y {
+                let pos = IVec2::new(x, y);
+                let p00 = self.pressure[pos];
+                let p10 = self.pressure[pos - IVec2::X];
+                let p01 = self.pressure[pos - IVec2::Y];
+                if !self.solids[pos] {
+                    if !self.solids[pos - IVec2::X] {
+                        self.xvel[pos] -= (p00 - p10) / self.xvel_weights[pos].max(0.00001);
+                    }
+                    if !self.solids[pos - IVec2::Y] {
+                        self.yvel[pos] -= (p00 - p01) / self.yvel_weights[pos].max(0.00001);
+                    }
                 }
             }
         }
@@ -322,9 +357,11 @@ impl Fluid {
     }
     fn step(&mut self, flip_ratio: f32) {
         self.p2g();
-        for _ in 0..50 {
+        self.init_pressure();
+        for _ in 0..200 {
             self.pressure_solve();
         }
+        self.finish_pressure();
         self.g2p(flip_ratio);
         self.advect();
         self.clamp();
@@ -364,7 +401,9 @@ impl Fluid {
             yvel: Grid::with_offset(size + IVec2::new(2, 1), Vec2::new(-0.5, 0.0), 0.0),
             yvel_weights: Grid::with_offset(size + IVec2::new(2, 1), Vec2::new(-0.5, 0.0), 0.0),
             last_yvel: Grid::with_offset(size + IVec2::new(2, 1), Vec2::new(-0.5, 0.0), 0.0),
-            divergence: Grid::new(size, 0.0),
+            pressure: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
+            next_pressure: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
+            divergence: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
             density: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
             grid_particles: Grid::new(size, SmallVec::new()),
         }
@@ -456,8 +495,8 @@ async fn main() {
             println!("FPS: {}", i as f32 / elapsed);
         }
 
-        fluid.draw_grid(8.0);
-        // fluid.draw_particles(8.0);
+        // fluid.draw_grid(8.0);
+        fluid.draw_particles(8.0);
 
         next_frame().await
     }
