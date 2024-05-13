@@ -9,7 +9,7 @@ use macroquad::prelude::*;
 use smallvec::SmallVec;
 
 #[allow(non_upper_case_globals)]
-const gravity: Vec2 = Vec2::new(0.0, -60.0);
+const gravity: Vec2 = Vec2::new(0.0, -1.0);
 #[allow(non_upper_case_globals)]
 const particle_radius: f32 = 0.3;
 #[allow(non_upper_case_globals)]
@@ -189,90 +189,90 @@ struct Particle {
 }
 
 struct Fluid {
-    particles: Vec<Particle>,
     solids: Grid<bool>,
     xvel: Grid<f32>,
     xvel_weights: Grid<f32>,
-    last_xvel: Grid<f32>,
     yvel: Grid<f32>,
     yvel_weights: Grid<f32>,
-    last_yvel: Grid<f32>,
     pressure: Grid<f32>,
     next_pressure: Grid<f32>,
     divergence: Grid<f32>,
-    density: Grid<f32>,
-    // Contains particles in area [x..x+1) x [y..y+1).
-    grid_particles: Grid<SmallVec<[u32; 6]>>,
+    mass: Grid<f32>,
+}
+
+fn prod(vec: Vec2) -> f32 {
+    vec.x * vec.y
+}
+fn lerp(t: f32, a: f32, b: f32) -> f32 {
+    a + (b - a) * t
 }
 
 impl Fluid {
     fn advect(&mut self) {
-        for p in &mut self.particles {
-            p.vel += gravity * dt;
-            p.vel += 0.01 * Vec2::from_angle(random::<f32>() * TAU);
-            if p.vel.is_nan() {
-                panic!("nan velocity");
-            }
-            p.pos += p.vel * dt;
-        }
-    }
-    fn clamp(&mut self) {
-        let size = self.size().as_vec2();
-        for p in &mut self.particles {
-            let pos = &mut p.pos;
-            if pos.x < 1.0 + particle_radius {
-                pos.x = 1.0 + particle_radius;
-                p.vel.x = 0.0;
-            }
-            if pos.y < 1.0 + particle_radius {
-                pos.y = 1.0 + particle_radius;
-                p.vel.y = 0.0;
-            }
-            if pos.x > size.x - 1.0 - particle_radius {
-                pos.x = size.x - 1.0 - particle_radius;
-                p.vel.x = 0.0;
-            }
-            if pos.y > size.y - 1.0 - particle_radius {
-                pos.y = size.y - 1.0 - particle_radius;
-                p.vel.y = 0.0;
-            }
-        }
-    }
-    fn remap(&mut self) {
-        self.grid_particles.set(SmallVec::new());
-        for (i, p) in self.particles.iter().enumerate() {
-            self.grid_particles[p.pos.floor().as_ivec2()].push(i as u32);
-        }
-    }
-    fn p2g(&mut self) {
+        let last_xvel = self.xvel.clone();
+        let last_yvel = self.yvel.clone();
+        let last_mass = self.mass.clone();
         self.xvel.set(0.0);
         self.xvel_weights.set(0.0);
         self.yvel.set(0.0);
         self.yvel_weights.set(0.0);
-        self.density.set(0.0);
-        for p in &self.particles {
-            self.xvel.distribute(p.pos, p.vel.x);
-            self.xvel_weights.distribute(p.pos, 1.0);
-            self.yvel.distribute(p.pos, p.vel.y);
-            self.yvel_weights.distribute(p.pos, 1.0);
-            self.density.distribute(p.pos, 1.0);
-        }
+        self.mass.set(0.0);
+        last_mass.foreach(|pos, mass| {
+            let vel_start_x = last_xvel[pos];
+            let vel_start_y = last_yvel[pos];
+            let vel_end_x = last_xvel[pos + IVec2::X];
+            let vel_end_y = last_yvel[pos + IVec2::Y];
+            let a = Vec2::new(vel_start_x, vel_start_y);
+            let b = Vec2::new(vel_end_x, vel_end_y) + 1.0;
+            let c = b - a;
+            let start = a.min(b);
+            let end = a.max(b);
+            let density = mass / prod(end - start).max(0.0001);
+            if density < 0.0001 || (end - start).min_element() < 0.0001 {
+                return;
+            }
+            for i in start.x.floor() as i32..=end.x.floor() as i32 {
+                for j in start.y.floor() as i32..=end.y.floor() as i32 {
+                    let offset = IVec2::new(i, j);
+                    let dst = pos + offset;
+                    let offset = offset.as_vec2();
+                    if self.solids[dst] {
+                        continue;
+                    }
+                    let intersection = end.min(offset + 1.0) - start.max(offset);
+                    let weight = prod(intersection) * density;
+                    self.mass[dst] += weight;
+                    // can remove for instability if want.
+                    let dst_start_inv = ((offset - a) / c).clamp(Vec2::ZERO, Vec2::ONE);
+                    let dst_end_inv = ((offset + 1.0 - a) / c).clamp(Vec2::ZERO, Vec2::ONE);
+                    self.xvel[dst] += lerp(dst_start_inv.x, vel_start_x, vel_end_x) * weight;
+                    // These can be replaced with just dividing by sum  of oposite weights.
+                    self.xvel_weights[dst] += weight;
+                    self.yvel[dst] += lerp(dst_start_inv.y, vel_start_y, vel_end_y) * weight;
+                    self.yvel_weights[dst] += weight;
+                    self.xvel[dst + IVec2::X] +=
+                        lerp(dst_end_inv.x, vel_start_x, vel_end_x) * weight;
+                    self.xvel_weights[dst + IVec2::X] += weight;
+                    self.yvel[dst + IVec2::Y] +=
+                        lerp(dst_end_inv.y, vel_start_y, vel_end_y) * weight;
+                    self.yvel_weights[dst + IVec2::Y] += weight;
+                }
+            }
+        });
         self.xvel = self.xvel.map2(&self.xvel_weights, |pos, x, w| {
             if self.solids[pos] || self.solids[pos - IVec2::X] {
                 0.0
             } else {
-                x / w.max(0.0001)
+                x / w.max(0.0001) + gravity.x * dt
             }
         });
         self.yvel = self.yvel.map2(&self.yvel_weights, |pos, x, w| {
             if self.solids[pos] || self.solids[pos - IVec2::Y] {
                 0.0
             } else {
-                x / w.max(0.0001)
+                x / w.max(0.0001) + gravity.y * dt
             }
         });
-        self.last_xvel.load_fn(|pos| self.xvel[pos]);
-        self.last_yvel.load_fn(|pos| self.yvel[pos]);
     }
     fn init_pressure(&mut self) {
         self.divergence.load_fn(|pos| {
@@ -288,14 +288,14 @@ impl Fluid {
         for x in (0..self.size().x).rev() {
             for y in (0..self.size().y).rev() {
                 let pos = IVec2::new(x, y);
-                if self.grid_particles[pos].is_empty() {
+                if self.mass[pos] < 0.0001 {
                     continue;
                 }
                 if self.solids[pos] {
                     continue;
                 }
-                let density = self.density[pos];
-                let ideal_value = (self.divergence[pos] - (density - 4.0)) * density;
+                let mass = self.mass[pos];
+                let ideal_value = (self.divergence[pos] - (mass - 1.0)) * mass;
                 let pressure = self.pressure[pos];
                 let adj_pressures = [
                     (-1, 0, -self.xvel[pos], self.xvel_weights[pos]),
@@ -347,91 +347,44 @@ impl Fluid {
             }
         }
     }
-    fn g2p(&mut self, flip_ratio: f32) {
-        for p in &mut self.particles {
-            p.vel.x =
-                self.xvel.sample(p.pos) + (p.vel.x - self.last_xvel.sample(p.pos)) * flip_ratio;
-            p.vel.y =
-                self.yvel.sample(p.pos) + (p.vel.y - self.last_yvel.sample(p.pos)) * flip_ratio;
-        }
-    }
-    fn step(&mut self, flip_ratio: f32) {
-        self.p2g();
+    fn step(&mut self) {
         self.init_pressure();
         for _ in 0..200 {
             self.pressure_solve();
         }
         self.finish_pressure();
-        self.g2p(flip_ratio);
         self.advect();
-        self.clamp();
-        self.remap();
-        self.random_collide();
-        self.clamp();
-        self.remap();
-    }
-    fn random_collide(&mut self) {
-        self.grid_particles.foreach(|_pos, mut particles| {
-            let particles = &mut *particles;
-            particles.shuffle(&mut thread_rng());
-            for ixs in particles.chunks_exact(2) {
-                let p1 = self.particles[ixs[0] as usize];
-                let p2 = self.particles[ixs[1] as usize];
-                let dist = p1.pos.distance(p2.pos);
-                if dist < 2.0 * particle_radius {
-                    if let Some(normal) = (p1.pos - p2.pos).try_normalize() {
-                        let move_dist = particle_radius - dist / 2.0;
-                        self.particles[ixs[0] as usize].pos += normal * move_dist;
-                        self.particles[ixs[1] as usize].pos -= normal * move_dist;
-                    }
-                }
-            }
-        })
     }
     fn init_grid(width: u32, height: u32) -> Self {
         let size = UVec2::new(width, height).as_ivec2();
         let mut solids = Grid::new(size, true);
         solids.load_fn(|IVec2 { x, y }| x == 0 || y == 0 || x == size.x - 1 || y == size.y - 1);
         Self {
-            particles: Vec::new(),
             solids,
             xvel: Grid::with_offset(size + IVec2::new(1, 2), Vec2::new(0.0, -0.5), 0.0),
             xvel_weights: Grid::with_offset(size + IVec2::new(1, 2), Vec2::new(0.0, -0.5), 0.0),
-            last_xvel: Grid::with_offset(size + IVec2::new(1, 2), Vec2::new(0.0, -0.5), 0.0),
             yvel: Grid::with_offset(size + IVec2::new(2, 1), Vec2::new(-0.5, 0.0), 0.0),
             yvel_weights: Grid::with_offset(size + IVec2::new(2, 1), Vec2::new(-0.5, 0.0), 0.0),
-            last_yvel: Grid::with_offset(size + IVec2::new(2, 1), Vec2::new(-0.5, 0.0), 0.0),
             pressure: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
             next_pressure: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
             divergence: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
-            density: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
-            grid_particles: Grid::new(size, SmallVec::new()),
+            mass: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
         }
     }
     fn fill_rect(&mut self, start: IVec2, size: IVec2) {
         for y in start.y..start.y + size.y {
             for x in start.x..start.x + size.x {
                 let pos = IVec2::new(x, y);
-                for i in 0..2 {
-                    for j in 0..2 {
-                        let particle = Particle {
-                            pos: pos.as_vec2()
-                                + Vec2::new(i as f32, j as f32) * 0.5
-                                + Vec2::new(random::<f32>() * 0.5, random::<f32>() * 0.5),
-                            vel: Vec2::ZERO,
-                        };
-                        self.particles.push(particle);
-                    }
-                }
+                self.mass[pos] = 1.0;
             }
         }
     }
     fn draw_grid(&self, scale: f32) {
-        self.density.foreach(|pos, particles| {
+        self.mass.foreach(|pos, density| {
             let color = if self.solids[pos] {
                 RED
             } else {
-                Color::from_vec((Vec3::splat(1.0) * (particles) / 6.0).extend(1.0))
+                Color::from_vec((Vec3::splat(1.0) * density / 3.0).extend(1.0))
             };
             let pos = pos.as_vec2() * scale;
             draw_rectangle(pos.x, screen_height() - pos.y - scale, scale, scale, color);
@@ -448,24 +401,8 @@ impl Fluid {
             draw_rectangle(pos.x, screen_height() - pos.y - scale, scale, scale, color);
         })
     }
-    fn draw_particles(&self, scale: f32) {
-        for p in &self.particles {
-            let pos = p.pos * scale;
-            draw_circle(
-                pos.x,
-                screen_height() - pos.y,
-                scale * particle_radius,
-                Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.2,
-                },
-            );
-        }
-    }
     fn size(&self) -> IVec2 {
-        self.grid_particles.size
+        self.mass.size
     }
 }
 
@@ -473,12 +410,10 @@ impl Fluid {
 async fn main() {
     let mut paused = false;
     let mut pressure = false;
-    let mut particles = true;
-    let mut density = false;
+    let mut density = true;
 
     let mut fluid = Fluid::init_grid(200, 100);
     fluid.fill_rect(IVec2::new(5, 5), IVec2::new(100, 70));
-    fluid.remap();
 
     request_new_screen_size(fluid.size().x as f32 * 8.0, fluid.size().y as f32 * 8.0);
 
@@ -493,13 +428,10 @@ async fn main() {
         }
 
         if !paused || is_key_pressed(KeyCode::Period) {
-            fluid.step(0.95);
+            fluid.step();
         }
         if is_key_pressed(KeyCode::P) {
             pressure = !pressure;
-        }
-        if is_key_pressed(KeyCode::O) {
-            particles = !particles;
         }
         if is_key_pressed(KeyCode::G) {
             density = !density;
@@ -516,9 +448,6 @@ async fn main() {
         }
         if pressure {
             fluid.draw_pressure(8.0);
-        }
-        if particles {
-            fluid.draw_particles(8.0);
         }
 
         next_frame().await
