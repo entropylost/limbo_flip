@@ -342,7 +342,7 @@ impl Fluid {
                 }
                 let density = self.density[pos];
                 let rest_density = self.rest_density[pos];
-                let ideal_value = (self.divergence[pos]) * density - (density - rest_density) * 4.0;
+                let ideal_value = (self.divergence[pos] - (density - rest_density)) * density;
                 let pressure = self.pressure[pos];
                 let adj_pressures = [
                     (-1, 0, -self.xvel[pos], self.xvel_weights[pos]),
@@ -413,9 +413,9 @@ impl Fluid {
         self.advect();
         self.clamp();
         self.remap();
-        // self.random_collide();
-        // self.clamp();
-        // self.remap();
+        self.random_collide();
+        self.clamp();
+        self.remap();
     }
     fn random_collide(&mut self) {
         self.grid_particles.foreach(|_pos, mut particles| {
@@ -428,9 +428,11 @@ impl Fluid {
                 if dist < 2.0 * particle_radius {
                     if let Some(normal) = (p1.pos - p2.pos).try_normalize() {
                         // TODO: Adjust for particle type.
-                        let move_dist = particle_radius - dist / 2.0;
-                        self.particles[ixs[0] as usize].pos += normal * move_dist;
-                        self.particles[ixs[1] as usize].pos -= normal * move_dist;
+                        let mass_portion = p2.ty.density() / (p1.ty.density() + p2.ty.density());
+                        let move_dist = 2.0 * particle_radius - dist;
+                        self.particles[ixs[0] as usize].pos += normal * move_dist * mass_portion;
+                        self.particles[ixs[1] as usize].pos -=
+                            normal * move_dist * (1.0 - mass_portion);
                     }
                 }
             }
@@ -522,8 +524,8 @@ async fn main() {
     let mut density = false;
 
     let mut fluid = Fluid::init_grid(200, 100);
-    fluid.fill_rect(IVec2::new(110, 5), IVec2::new(70, 70), ParticleType::Water);
-    fluid.fill_rect(IVec2::new(5, 5), IVec2::new(100, 70), ParticleType::Air);
+    fluid.fill_rect(IVec2::new(80, 60), IVec2::new(40, 30), ParticleType::Water);
+    fluid.fill_rect(IVec2::new(5, 5), IVec2::new(170, 40), ParticleType::Oil);
     fluid.remap();
 
     request_new_screen_size(fluid.size().x as f32 * 8.0, fluid.size().y as f32 * 8.0);
@@ -539,7 +541,7 @@ async fn main() {
         }
 
         if !paused || is_key_pressed(KeyCode::Period) {
-            fluid.step(0.0);
+            fluid.step(0.95);
         }
         if is_key_pressed(KeyCode::P) {
             pressure = !pressure;
