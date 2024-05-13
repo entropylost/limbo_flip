@@ -100,6 +100,15 @@ impl<T: Clone> Grid<T> {
         }
         result
     }
+    fn map_to<S>(&self, mut f: impl FnMut(T) -> S, default: S) -> Grid<S> {
+        Grid {
+            data: self.data.iter().map(|x| f(x.clone())).collect(),
+            size: self.size,
+            offset: self.offset,
+            frac_offset: self.frac_offset,
+            default,
+        }
+    }
     fn map2<S>(&self, other: &Grid<S>, mut f: impl FnMut(IVec2, T, S) -> T) -> Self
     where
         S: Clone,
@@ -184,6 +193,43 @@ impl<T: Add<Output = T> + Mul<f32, Output = T> + Clone> Grid<T> {
 struct Particle {
     pos: Vec2,
     vel: Vec2,
+}
+
+struct SolidMask {
+    xs: Grid<bool>,
+    xv: Grid<f32>,
+    ys: Grid<bool>,
+    yv: Grid<f32>,
+}
+impl SolidMask {
+    fn from_grid(solids: Grid<bool>, velocity: Vec2) -> Self {
+        let size = solids.size;
+        let mut xs = Grid::with_offset(size + IVec2::new(1, 0), Vec2::new(0.0, 0.5), false);
+        let xv = Grid::with_offset(size + IVec2::new(1, 0), Vec2::new(0.0, 0.5), velocity.x);
+        let mut ys = Grid::with_offset(size + IVec2::new(0, 1), Vec2::new(0.5, 0.0), false);
+        let yv = Grid::with_offset(size + IVec2::new(0, 1), Vec2::new(0.5, 0.0), velocity.y);
+        solids.foreach(|pos, solid| {
+            if solid {
+                xs[pos] = true;
+                ys[pos] = true;
+                xs[pos + IVec2::X] = true;
+                ys[pos + IVec2::Y] = true;
+            }
+        });
+        Self { xs, xv, ys, yv }
+    }
+    fn over(&self, other: &Self) -> Self {
+        Self {
+            xs: self.xs.map2(&other.xs, |_, a, b| a || b),
+            xv: self
+                .xv
+                .map2(&other.xv, |pos, a, b| if other.xs[pos] { b } else { a }),
+            ys: self.ys.map2(&other.ys, |_, a, b| a || b),
+            yv: self
+                .yv
+                .map2(&other.yv, |pos, a, b| if other.ys[pos] { b } else { a }),
+        }
+    }
 }
 
 struct Fluid {
@@ -285,13 +331,20 @@ impl Fluid {
         });
         self.pressure.set(0.0);
     }
-    fn pressure_solve(&mut self) {
+    fn pressure_solve(&mut self, overlay_solids: Option<&SolidMask>) {
+        let solids = SolidMask::from_grid(self.solids.clone(), Vec2::ZERO);
+        let solids = if let Some(overlay) = overlay_solids {
+            solids.over(overlay)
+        } else {
+            solids
+        };
+
         for x in (0..self.size().x).rev() {
             for y in (0..self.size().y).rev() {
                 let pos = IVec2::new(x, y);
-                if self.grid_particles[pos].is_empty() {
-                    continue;
-                }
+                // if self.grid_particles[pos].is_empty() {
+                //     continue;
+                // }
                 if self.solids[pos] {
                     continue;
                 }
@@ -299,26 +352,44 @@ impl Fluid {
                 let ideal_value = (self.divergence[pos] - (density - self.rest_density)) * density;
                 let pressure = self.pressure[pos];
                 let adj_pressures = [
-                    (-1, 0, -self.xvel[pos], self.xvel_weights[pos]),
+                    (
+                        -1,
+                        0,
+                        -self.xvel[pos],
+                        self.xvel_weights[pos],
+                        -solids.xv[pos],
+                        solids.xs[pos],
+                    ),
                     (
                         1,
                         0,
                         self.xvel[pos + IVec2::X],
                         self.xvel_weights[pos + IVec2::X],
+                        solids.xv[pos + IVec2::X],
+                        solids.xs[pos + IVec2::X],
                     ),
-                    (0, -1, -self.yvel[pos], self.yvel_weights[pos]),
+                    (
+                        0,
+                        -1,
+                        -self.yvel[pos],
+                        self.yvel_weights[pos],
+                        -solids.yv[pos],
+                        solids.ys[pos],
+                    ),
                     (
                         0,
                         1,
                         self.yvel[pos + IVec2::Y],
                         self.yvel_weights[pos + IVec2::Y],
+                        solids.yv[pos + IVec2::Y],
+                        solids.ys[pos + IVec2::Y],
                     ),
                 ]
                 .into_iter()
-                .map(|(dx, dy, vel, weight)| {
+                .map(|(dx, dy, vel, weight, solid_vel, solid)| {
                     let pos = pos + IVec2::new(dx, dy);
-                    if self.solids[pos] {
-                        pressure + vel * weight
+                    if solid {
+                        pressure + (vel - solid_vel) * weight
                     } else {
                         self.pressure[pos]
                     }
@@ -356,11 +427,10 @@ impl Fluid {
                 self.yvel.sample(p.pos) + (p.vel.y - self.last_yvel.sample(p.pos)) * flip_ratio;
         }
     }
-    fn step(&mut self, flip_ratio: f32) {
-        self.p2g();
+    fn step_with(&mut self, flip_ratio: f32, overlay_solids: Option<&SolidMask>) {
         self.init_pressure();
         for _ in 0..200 {
-            self.pressure_solve();
+            self.pressure_solve(overlay_solids);
         }
         self.finish_pressure();
         self.g2p(flip_ratio);
@@ -370,6 +440,10 @@ impl Fluid {
         self.random_collide();
         self.clamp();
         self.remap();
+        self.p2g();
+    }
+    fn step(&mut self, flip_ratio: f32) {
+        self.step_with(flip_ratio, None);
     }
     fn random_collide(&mut self) {
         self.grid_particles.foreach(|_pos, mut particles| {
@@ -513,6 +587,14 @@ impl Fluid {
     fn size(&self) -> IVec2 {
         self.grid_particles.size
     }
+    fn mask(&self, cutoff: f32) -> SolidMask {
+        SolidMask {
+            xs: self.xvel_weights.map_to(|w| w > cutoff, false),
+            xv: self.xvel.clone(),
+            ys: self.yvel_weights.map_to(|w| w > cutoff, false),
+            yv: self.yvel.clone(),
+        }
+    }
 }
 
 #[macroquad::main("BasicShapes")]
@@ -527,10 +609,12 @@ async fn main() {
     let mut fluid = Fluid::init_grid(200, 100, Vec2::new(0.0, -10.0), 1.0, 4.0);
     fluid.fill_rect(IVec2::new(5, 5), IVec2::new(100, 70));
     fluid.remap();
+    fluid.p2g();
 
     let mut gas = Fluid::init_grid(200, 100, Vec2::new(0.0, -10.0), 0.8, 4.0);
     gas.fill_rect(IVec2::new(120, 5), IVec2::new(70, 90));
     gas.remap();
+    gas.p2g();
 
     request_new_screen_size(fluid.size().x as f32 * scale, fluid.size().y as f32 * scale);
 
@@ -546,11 +630,12 @@ async fn main() {
 
         if !paused || is_key_pressed(KeyCode::Period) {
             fluid.step(0.0);
-            gas.step(0.0);
             fluid.collide_with(&mut gas, 0.5);
             fluid.collide_with(&mut gas, 0.5);
-            fluid.collide_with(&mut gas, 0.5);
-            fluid.collide_with(&mut gas, 0.5);
+            gas.step_with(0.0, Some(&fluid.mask(3.0)));
+            // fluid.collide_with(&mut gas, 0.5);
+            // fluid.collide_with(&mut gas, 0.5);
+            // fluid.collide_with(&mut gas, 0.5);
         }
         if is_key_pressed(KeyCode::P) {
             pressure = !pressure;
