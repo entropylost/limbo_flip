@@ -9,8 +9,6 @@ use macroquad::prelude::*;
 use smallvec::SmallVec;
 
 #[allow(non_upper_case_globals)]
-const gravity: Vec2 = Vec2::new(0.0, -60.0);
-#[allow(non_upper_case_globals)]
 const particle_radius: f32 = 0.3;
 #[allow(non_upper_case_globals)]
 const dt: f32 = 1.0 / 60.0;
@@ -203,12 +201,15 @@ struct Fluid {
     density: Grid<f32>,
     // Contains particles in area [x..x+1) x [y..y+1).
     grid_particles: Grid<SmallVec<[u32; 6]>>,
+    particle_mass: f32,
+    gravity: Vec2,
+    rest_density: f32,
 }
 
 impl Fluid {
     fn advect(&mut self) {
         for p in &mut self.particles {
-            p.vel += gravity * dt;
+            p.vel += self.gravity * dt;
             p.vel += 0.01 * Vec2::from_angle(random::<f32>() * TAU);
             if p.vel.is_nan() {
                 panic!("nan velocity");
@@ -295,7 +296,7 @@ impl Fluid {
                     continue;
                 }
                 let density = self.density[pos];
-                let ideal_value = (self.divergence[pos] - (density - 4.0)) * density;
+                let ideal_value = (self.divergence[pos] - (density - self.rest_density)) * density;
                 let pressure = self.pressure[pos];
                 let adj_pressures = [
                     (-1, 0, -self.xvel[pos], self.xvel_weights[pos]),
@@ -388,7 +389,54 @@ impl Fluid {
             }
         })
     }
-    fn init_grid(width: u32, height: u32) -> Self {
+    fn collide_with(&mut self, other: &mut Fluid, radius: f32) {
+        assert!(radius <= 0.5);
+        let sep = radius * 2.0;
+        let sep2 = sep * sep;
+        let mass_portion = other.particle_mass / (self.particle_mass + other.particle_mass);
+        self.grid_particles.foreach(|pos, particles| {
+            if particles.is_empty() {
+                return;
+            }
+            for dx in -1..=1 {
+                for dy in -1..=1 {
+                    let other_particles = &other.grid_particles[pos + IVec2::new(dx, dy)];
+                    if other_particles.is_empty() {
+                        continue;
+                    }
+                    for i in &particles {
+                        let p1 = &mut self.particles[*i as usize];
+                        for j in other_particles {
+                            let p2 = &mut other.particles[*j as usize];
+                            let dist2 = p1.pos.distance_squared(p2.pos);
+                            if dist2 < sep2 {
+                                if let Some(normal) = (p1.pos - p2.pos).try_normalize() {
+                                    let move_dist = sep - dist2.sqrt();
+
+                                    p1.pos += normal * move_dist * mass_portion;
+                                    p2.pos -= normal * move_dist * (1.0 - mass_portion);
+
+                                    p1.vel += normal * move_dist * mass_portion / dt;
+                                    p2.vel -= normal * move_dist * (1.0 - mass_portion) / dt;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        self.clamp();
+        self.remap();
+        other.clamp();
+        other.remap();
+    }
+    fn init_grid(
+        width: u32,
+        height: u32,
+        gravity: Vec2,
+        particle_mass: f32,
+        rest_density: f32,
+    ) -> Self {
         let size = UVec2::new(width, height).as_ivec2();
         let mut solids = Grid::new(size, true);
         solids.load_fn(|IVec2 { x, y }| x == 0 || y == 0 || x == size.x - 1 || y == size.y - 1);
@@ -406,6 +454,9 @@ impl Fluid {
             divergence: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
             density: Grid::with_offset(size, Vec2::new(0.5, 0.5), 0.0),
             grid_particles: Grid::new(size, SmallVec::new()),
+            gravity,
+            particle_mass,
+            rest_density,
         }
     }
     fn fill_rect(&mut self, start: IVec2, size: IVec2) {
@@ -448,19 +499,14 @@ impl Fluid {
             draw_rectangle(pos.x, screen_height() - pos.y - scale, scale, scale, color);
         })
     }
-    fn draw_particles(&self, scale: f32) {
+    fn draw_particles(&self, scale: f32, color: Color) {
         for p in &self.particles {
             let pos = p.pos * scale;
             draw_circle(
                 pos.x,
                 screen_height() - pos.y,
                 scale * particle_radius,
-                Color {
-                    r: 1.0,
-                    g: 1.0,
-                    b: 1.0,
-                    a: 0.2,
-                },
+                color,
             );
         }
     }
@@ -471,16 +517,22 @@ impl Fluid {
 
 #[macroquad::main("BasicShapes")]
 async fn main() {
+    let scale = 8.0;
+
     let mut paused = false;
     let mut pressure = false;
     let mut particles = true;
     let mut density = false;
 
-    let mut fluid = Fluid::init_grid(200, 100);
+    let mut fluid = Fluid::init_grid(200, 100, Vec2::new(0.0, -10.0), 1.0, 4.0);
     fluid.fill_rect(IVec2::new(5, 5), IVec2::new(100, 70));
     fluid.remap();
 
-    request_new_screen_size(fluid.size().x as f32 * 8.0, fluid.size().y as f32 * 8.0);
+    let mut gas = Fluid::init_grid(200, 100, Vec2::new(0.0, -10.0), 0.8, 4.0);
+    gas.fill_rect(IVec2::new(120, 5), IVec2::new(70, 90));
+    gas.remap();
+
+    request_new_screen_size(fluid.size().x as f32 * scale, fluid.size().y as f32 * scale);
 
     let start = Instant::now();
     let mut i = 0;
@@ -493,7 +545,12 @@ async fn main() {
         }
 
         if !paused || is_key_pressed(KeyCode::Period) {
-            fluid.step(0.95);
+            fluid.step(0.0);
+            gas.step(0.0);
+            fluid.collide_with(&mut gas, 0.5);
+            fluid.collide_with(&mut gas, 0.5);
+            fluid.collide_with(&mut gas, 0.5);
+            fluid.collide_with(&mut gas, 0.5);
         }
         if is_key_pressed(KeyCode::P) {
             pressure = !pressure;
@@ -512,13 +569,30 @@ async fn main() {
         }
 
         if density {
-            fluid.draw_grid(8.0);
+            fluid.draw_grid(scale);
         }
         if pressure {
-            fluid.draw_pressure(8.0);
+            fluid.draw_pressure(scale);
         }
         if particles {
-            fluid.draw_particles(8.0);
+            gas.draw_particles(
+                scale,
+                Color {
+                    r: 0.6,
+                    g: 1.0,
+                    b: 0.6,
+                    a: 0.2,
+                },
+            );
+            fluid.draw_particles(
+                scale,
+                Color {
+                    r: 0.6,
+                    g: 0.6,
+                    b: 1.0,
+                    a: 0.5,
+                },
+            );
         }
 
         next_frame().await
